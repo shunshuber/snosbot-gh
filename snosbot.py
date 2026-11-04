@@ -32,6 +32,13 @@ from pyrogram.errors import (
     UsernameInvalid,
     UsernameNotOccupied,
     MessageNotModified,
+    SessionPasswordNeeded,
+    PhoneCodeInvalid,
+    PhoneCodeExpired,
+    PhoneNumberInvalid,
+    PhoneNumberUnoccupied,
+    PhoneNumberFlood,
+    PasswordHashInvalid,
 )
 from pyrogram.raw import functions as rawf, types as rawt
 
@@ -506,7 +513,31 @@ async def run_snos(app: Client, chat_id: int, target_str: str, reason: str, per:
     )
 
 
-# ------------------------------------------------------------------ bot ui ---
+# --------------------------------------------------------------- login ui ---
+
+LOGINS: dict = {}  # chat_id -> {"phone", "client", "hash", "stage", "tries"}
+
+
+def normalize_phone(raw: str) -> str:
+    d = re.sub(r"\D", "", raw)
+    if len(d) == 11 and d[0] == "8":
+        d = "7" + d[1:]
+    return "+" + d
+
+
+def finish_login(chat_id) -> None:
+    state = LOGINS.pop(chat_id, None)
+    if not state or not state.get("client"):
+        return
+    client = state["client"]
+
+    async def _stop() -> None:
+        with contextlib.suppress(Exception):
+            await client.disconnect()
+
+    with contextlib.suppress(Exception):
+        asyncio.get_running_loop().create_task(_stop())
+
 
 app = Client(
     "snosbot",
@@ -517,11 +548,118 @@ app = Client(
 )
 
 
+def _login_client(chat_id: int) -> Client:
+    device_model, sysver = random.choice(DEVICES)
+    return Client(
+        f"login-{chat_id}",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        in_memory=True,
+        device_model=device_model,
+        system_version=sysver,
+        app_version=f"{random.randint(3, 10)}.{random.randint(0, 15)}.0",
+        lang_code=random.choice(LANGS),
+        proxy=PROXIES[0] if PROXIES else None,
+    )
+
+
+async def start_login(client: Client, message, phone_raw: str) -> None:
+    chat_id = message.chat.id
+    finish_login(chat_id)
+    phone = normalize_phone(phone_raw)
+    state = {"phone": phone, "client": None, "hash": "", "stage": "code", "tries": 0}
+    LOGINS[chat_id] = state
+    log(f"<- login request {chat_id} {phone}")
+
+    lc = _login_client(chat_id)
+    try:
+        await lc.connect()
+        sent = await lc.send_phone_number_code(phone)
+    except PhoneNumberInvalid:
+        finish_login(chat_id)
+        await message.reply("номер не принят")
+        return
+    except PhoneNumberFlood:
+        finish_login(chat_id)
+        await message.reply("флуд на номер — позже")
+        return
+    except (OSError, RPCError) as e:
+        finish_login(chat_id)
+        await message.reply(f"не вышло: {type(e).__name__}")
+        return
+
+    state["client"] = lc
+    state["hash"] = sent.phone_code_hash
+    await message.reply("код?")
+
+
+async def login_export(message, lc: Client) -> None:
+    sess = await lc.export_session_string()
+    pool = load_pool()
+    if sess not in pool:
+        pool.append(sess)
+        save_pool(pool)
+    finish_login(message.chat.id)
+    log(f"[+] login done {message.chat.id} (пул {len(pool)})")
+    await message.reply(f"+1 (пул {len(pool)})")
+
+
+async def login_accept_code(message, state: dict, code: str) -> None:
+    lc = state["client"]
+    try:
+        await lc.sign_in(state["phone"], state["hash"], code)
+    except PhoneCodeInvalid:
+        await message.reply("неверный код")
+        return
+    except PhoneCodeExpired:
+        finish_login(message.chat.id)
+        await message.reply("код истёк — /acc заново")
+        return
+    except SessionPasswordNeeded:
+        state["stage"] = "2fa"
+        await message.reply("2fa?")
+        return
+    except PhoneNumberUnoccupied:
+        finish_login(message.chat.id)
+        await message.reply("аккаунта нет на номере")
+        return
+    except (OSError, RPCError) as e:
+        finish_login(message.chat.id)
+        await message.reply(f"не вышло: {type(e).__name__}")
+        return
+
+    await login_export(message, lc)
+
+
+async def login_accept_password(message, state: dict, password: str) -> None:
+    lc = state["client"]
+    try:
+        await lc.check_password(password)
+    except PasswordHashInvalid:
+        state["tries"] += 1
+        if state["tries"] >= 3:
+            finish_login(message.chat.id)
+            await message.reply("3 раза мимо — /acc заново")
+            log(f"[-] login 2fa fail x3 {message.chat.id}")
+            return
+        await message.reply("неверный")
+        return
+    except (OSError, RPCError) as e:
+        finish_login(message.chat.id)
+        await message.reply(f"не вышло: {type(e).__name__}")
+        return
+
+    await login_export(message, lc)
+
+
 def gate(_, __, message):
     return OWNER_ID == 0 or (message.from_user and message.from_user.id == OWNER_ID)
 
 
-FLTR = filters.command(["acc", "accs", "rm", "sn", "stop", "stat", "reasons"]) & filters.create(gate)
+FLTR = (
+    filters.command(["acc", "accs", "rm", "sn", "stop", "stat", "reasons", "cancel"])
+    | filters.create(lambda _, __, m: bool(m.chat and m.chat.id in LOGINS))
+) & filters.create(gate)
 
 
 @app.on_message(FLTR)
@@ -531,7 +669,40 @@ async def dispatcher(client: Client, message):
     cmd = parts[0].split("@")[0].lstrip("/").lower()
     args = parts[1:]
 
+    # интерактивный логин — пока активен, все не-команды это код/2fa
+    state = LOGINS.get(message.chat.id)
+    if state and cmd not in {"acc", "accs", "rm", "sn", "stop", "stat", "reasons", "cancel"}:
+        text0 = (message.text or "").strip()
+        log(f"<- login {message.chat.id} ({state['stage']}) {text0[:24]!r}")
+        if state["stage"] == "code":
+            if text0.isdigit():
+                await login_accept_code(message, state, text0)
+            else:
+                await message.reply("код?")
+        elif state["stage"] == "2fa":
+            await login_accept_password(message, state, text0)
+        return
+
+    if cmd == "cancel":
+        if state:
+            finish_login(message.chat.id)
+            await message.reply("снят")
+        else:
+            await message.reply("нечего отменять")
+        return
+
     if cmd == "acc":
+        # /acc +7... — интерактивный логин: код → 2fa → в пул
+        probe = "".join(args) if args else ""
+        digits = re.sub(r"\D", "", probe)
+        if (
+            args
+            and (args[0].startswith("+") or (args[0].startswith("8") and args[0].isdigit()))
+            and 7 <= len(digits) <= 15
+            and len(probe) < 32
+        ):
+            await start_login(client, message, probe)
+            return
         # строки сессий — остальной текст сообщения без первой строки-команды
         body = "\n".join((message.text or "").splitlines()[1:])
         got = []
