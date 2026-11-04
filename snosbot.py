@@ -10,12 +10,15 @@ snosbot.py — контроль пула сессий и сноса через �
 
 import asyncio
 import contextlib
+import logging
 import os
 import pathlib
 import random
 import re
 import sys
 import urllib.parse
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
 from pyrogram import Client, filters, enums
 from pyrogram.errors import (
@@ -523,6 +526,7 @@ FLTR = filters.command(["acc", "accs", "rm", "sn", "stop", "stat", "reasons"]) &
 
 @app.on_message(FLTR)
 async def dispatcher(client: Client, message):
+    log(f"<- {message.from_user.id if message.from_user else '?'} {message.text}")
     parts = (message.text or "").split()
     cmd = parts[0].split("@")[0].lstrip("/").lower()
     args = parts[1:]
@@ -600,6 +604,7 @@ def main() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
     log("[*] snosbot запущен")
     app.run()
+
 
 
 if __name__ == "__main__":

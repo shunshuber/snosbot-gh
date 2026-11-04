@@ -2,8 +2,6 @@ name: snosbot
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "5 * * * *"  # каждый час :05; job живёт до 55 мин, конса cancel-in-progress
 
 concurrency:
   group: snosbot
@@ -32,6 +30,24 @@ jobs:
 
       - name: deps
         run: pip install kurigram tgcrypto python-socks
+
+      - name: smoke
+        run: |
+          python snosbot.py > bot.log 2>&1 &
+          PID=$!
+          sleep 75
+          kill $PID 2>/dev/null || true
+          sleep 2
+          echo "=== bot.log ==="
+          cat bot.log
+          echo "=== bot api getMe ==="
+          curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getMe"; echo
+          echo "=== bot api getUpdates ==="
+          curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?timeout=2"; echo
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
 
       - name: bot
         run: python snosbot.py
