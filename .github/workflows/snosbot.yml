@@ -1,0 +1,39 @@
+name: snosbot
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: snosbot
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            pool.txt
+            snosbot.session
+            snosbot.session-journal
+          key: snosbot-${{ github.run_id }}
+          restore-keys: |
+            snosbot-
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: deps
+        run: pip install kurigram tgcrypto python-socks
+
+      - name: bot
+        run: python snosbot.py
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
