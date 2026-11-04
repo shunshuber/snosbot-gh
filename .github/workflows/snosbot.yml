@@ -2,6 +2,8 @@ name: snosbot
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "5 * * * *"  # каждый час :05; job живёт до 55 мин, конса cancel-in-progress
 
 concurrency:
   group: snosbot
